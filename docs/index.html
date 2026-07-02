@@ -113,7 +113,7 @@ const ROLES = ["Admin", "Project Owner", "Stakeholder", "Viewer"];
    Debe terminar en /exec. Los usuarios nunca tendrán que introducirla.
 ---------------------------------------------------------------- */
 const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbxv-4f-sLLJR1UEXFeATP7kCAPPDIUt1dUfDE1o_pKZAP1054vXkmgqUVuIa5eAHk2Yzg/exec";
-const SHEET_POLL_MS = 15000; // refresca la app leyendo el Sheet cada 15 segundos
+const SHEET_POLL_MS = 5000; // refresca la app leyendo el Sheet cada 5 segundos
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -203,7 +203,7 @@ const SEED_PROJECTS = [
    - useSheetCollection: lee/escribe una "tabla" en el Sheet vía fetch()
      contra el Apps Script y se refresca periódicamente para pintar datos
      modificados en el Sheet.
-   - useSession: quién ha iniciado sesión en este navegador.
+   - useSession: quién ha iniciado sesión solo en memoria. No usa almacenamiento local.
 ---------------------------------------------------------------- */
 async function sheetGet(apiUrl, key) {
   const res = await fetch(`${apiUrl}?action=get&key=${encodeURIComponent(key)}`);
@@ -296,13 +296,10 @@ function useSheetCollection(apiUrl, key, seed) {
 }
 
 function useSession() {
-  const [email, setEmailState] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("session-email") || "null"); } catch { return null; }
-  });
-  const setEmail = useCallback((val) => {
-    setEmailState(val);
-    try { localStorage.setItem("session-email", JSON.stringify(val)); } catch { /* non-fatal */ }
-  }, []);
+  // Sesión solo en memoria: al cerrar o recargar el navegador se vuelve a pedir usuario.
+  // Los datos de proyectos, usuarios y notificaciones viven únicamente en el Google Sheet vía Apps Script.
+  const [email, setEmailState] = useState(null);
+  const setEmail = useCallback((val) => setEmailState(val), []);
   return { email, setEmail, loading: false };
 }
 
@@ -466,43 +463,108 @@ function SetupAdmin({ onCreate }) {
   );
 }
 
-function SignIn({ users, onSignIn }) {
+function SignIn({ users, projects, onSignIn }) {
   const active = users.filter((u) => u.active);
   const [email, setEmail] = useState("");
   const match = active.find((u) => u.email === email.trim().toLowerCase());
+  const visibleProjects = (projects || []).filter((p) => !p.archived).slice(0, 6);
+  const counts = { green: 0, amber: 0, red: 0 };
+  (projects || []).filter((p) => !p.archived).forEach((p) => { if (counts[p.semaphore] !== undefined) counts[p.semaphore]++; });
+
   return (
-    <div className="min-h-screen flex items-center justify-center px-4" style={{ background: COLORS.paper, fontFamily: "'Inter', sans-serif" }}>
+    <div className="min-h-screen px-4 py-8 flex items-center justify-center" style={{ background: COLORS.paper, fontFamily: "'Inter', sans-serif" }}>
       <style>{FONT_IMPORT}</style>
-      <div className="w-full max-w-sm bg-white rounded-2xl border p-7" style={{ borderColor: COLORS.line }}>
-        <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4" style={{ background: COLORS.accent }}>
-          <Lock size={18} color="white" />
+      <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
+        <div className="bg-white rounded-2xl border p-7" style={{ borderColor: COLORS.line }}>
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4" style={{ background: COLORS.accent }}>
+            <Lock size={18} color="white" />
+          </div>
+          <h1 className="text-xl font-bold mb-1" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Selecciona tu usuario</h1>
+          <p className="text-sm mb-5" style={{ color: COLORS.textDim }}>
+            La información se acaba de leer del Google Sheet. Este navegador no guarda datos de la app en local.
+          </p>
+          <Field label="Correo">
+            <input className={inputCls} style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@empresa.com" />
+          </Field>
+          <button
+            disabled={!match}
+            onClick={() => onSignIn(match.email)}
+            style={{ background: match ? COLORS.accent : "#C7C8E8" }}
+            className="w-full py-2.5 rounded-lg text-sm font-semibold text-white transition mb-4"
+          >
+            Entrar
+          </button>
+          {active.length > 0 && (
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.textDim }}>Usuarios cargados desde el Sheet</p>
+              <div className="space-y-1 max-h-52 overflow-y-auto">
+                {active.map((u) => (
+                  <button key={u.id} onClick={() => onSignIn(u.email)} className="w-full flex items-center justify-between text-left px-2.5 py-1.5 rounded-lg hover:bg-gray-50 text-sm">
+                    <span>{u.name} <span style={{ color: COLORS.textDim }}>· {u.role}</span></span>
+                    <ArrowRight size={13} color={COLORS.textDim} />
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
-        <h1 className="text-xl font-bold mb-1" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Selecciona tu usuario</h1>
-        <p className="text-sm mb-5" style={{ color: COLORS.textDim }}>Este prototipo no valida contraseña: identifica tu correo registrado para entrar con tus permisos.</p>
-        <Field label="Correo">
-          <input className={inputCls} style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@empresa.com" />
-        </Field>
-        <button
-          disabled={!match}
-          onClick={() => onSignIn(match.email)}
-          style={{ background: match ? COLORS.accent : "#C7C8E8" }}
-          className="w-full py-2.5 rounded-lg text-sm font-semibold text-white transition mb-4"
-        >
-          Entrar
-        </button>
-        {active.length > 0 && (
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.textDim }}>Usuarios dados de alta</p>
-            <div className="space-y-1 max-h-40 overflow-y-auto">
-              {active.map((u) => (
-                <button key={u.id} onClick={() => onSignIn(u.email)} className="w-full flex items-center justify-between text-left px-2.5 py-1.5 rounded-lg hover:bg-gray-50 text-sm">
-                  <span>{u.name} <span style={{ color: COLORS.textDim }}>· {u.role}</span></span>
-                  <ArrowRight size={13} color={COLORS.textDim} />
-                </button>
-              ))}
+
+        <div className="bg-white rounded-2xl border p-7" style={{ borderColor: COLORS.line }}>
+          <div className="flex items-start justify-between gap-3 mb-5">
+            <div>
+              <h2 className="text-xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Datos actuales del Sheet</h2>
+              <p className="text-sm mt-1" style={{ color: COLORS.textDim }}>
+                Esto se pinta antes de iniciar sesión para confirmar que la app está leyendo el Sheet.
+              </p>
+            </div>
+            <Pill color={COLORS.green} soft={COLORS.greenSoft}><CheckCircle2 size={12} /> Sheet conectado</Pill>
+          </div>
+
+          <div className="grid grid-cols-4 gap-2 mb-5">
+            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
+              <div className="text-xs" style={{ color: COLORS.textDim }}>Proyectos</div>
+              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{(projects || []).filter((p) => !p.archived).length}</div>
+            </div>
+            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
+              <div className="text-xs" style={{ color: COLORS.textDim }}>Verde</div>
+              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.green }}>{counts.green}</div>
+            </div>
+            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
+              <div className="text-xs" style={{ color: COLORS.textDim }}>Ámbar</div>
+              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.amber }}>{counts.amber}</div>
+            </div>
+            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
+              <div className="text-xs" style={{ color: COLORS.textDim }}>Rojo</div>
+              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.red }}>{counts.red}</div>
             </div>
           </div>
-        )}
+
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {visibleProjects.length === 0 && (
+              <div className="rounded-xl border p-4 text-sm" style={{ borderColor: COLORS.line, color: COLORS.textDim }}>
+                Todavía no hay proyectos guardados en el Sheet. Entra como admin y crea el primer registro; se guardará inmediatamente en la pestaña KV.
+              </div>
+            )}
+            {visibleProjects.map((p) => {
+              const sem = SEMAFORO[p.semaphore] || SEMAFORO.green;
+              return (
+                <div key={p.id} className="rounded-xl border p-4" style={{ borderColor: COLORS.line }}>
+                  <div className="flex items-start gap-3">
+                    <SignalBar semaphore={p.semaphore} />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-semibold truncate">{p.name}</div>
+                      <p className="text-xs mt-1 line-clamp-2" style={{ color: COLORS.textDim }}>{p.summary || p.objective || "Sin resumen"}</p>
+                      <div className="flex items-center gap-2 mt-2 flex-wrap">
+                        <Pill color={sem.color} soft={sem.soft}>{sem.label}</Pill>
+                        <span className="text-xs" style={{ color: COLORS.textDim }}>Última actualización: {fmtDate(p.lastUpdateAt)}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1348,7 +1410,7 @@ function App() {
 }
 
 function ConnectedApp({ apiUrl }) {
-  const { data: allProjects, setData: persistProjects, loading: loadingProjects, error: projectsError, saving } = useSheetCollection(apiUrl, "projects-data", SEED_PROJECTS);
+  const { data: allProjects, setData: persistProjects, loading: loadingProjects, error: projectsError, saving } = useSheetCollection(apiUrl, "projects-data", []);
   const { data: users, setData: persistUsers, loading: loadingUsers, error: usersError } = useSheetCollection(apiUrl, "users-data", []);
   const { data: notifications, setData: persistNotifications, error: notifError } = useSheetCollection(apiUrl, "notifications-data", []);
   const { email: sessionEmail, setEmail: setSessionEmail } = useSession();
@@ -1399,7 +1461,7 @@ function ConnectedApp({ apiUrl }) {
 
   const currentUser = users.find((u) => u.email === sessionEmail && u.active);
   if (!currentUser) {
-    return <SignIn users={users} onSignIn={setSessionEmail} />;
+    return <SignIn users={users} projects={allProjects} onSignIn={setSessionEmail} />;
   }
 
   const isAdmin = currentUser.role === "Admin";
