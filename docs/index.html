@@ -113,7 +113,7 @@ const ROLES = ["Admin", "Project Owner", "Stakeholder", "Viewer"];
    Debe terminar en /exec. Los usuarios nunca tendrán que introducirla.
 ---------------------------------------------------------------- */
 const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbxv-4f-sLLJR1UEXFeATP7kCAPPDIUt1dUfDE1o_pKZAP1054vXkmgqUVuIa5eAHk2Yzg/exec";
-const SHEET_POLL_MS = 20000; // refresca leyendo el Sheet cada 20s (5s saturaba Apps Script con 3 tablas en paralelo)
+const SHEET_POLL_MS = 45000; // refresca leyendo el Sheet cada 45s (menos tráfico de fondo = menos contención al guardar)
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -286,8 +286,23 @@ async function sheetGet(apiUrl, key, token) {
 }
 
 async function sheetSet(apiUrl, key, value, token) {
-  await apiCall(apiUrl, { action: "set", key, value, token });
-  return true;
+  const BUSY_RETRY_DELAYS_MS = [700, 1500, 2500];
+  let lastErr = null;
+  for (let i = 0; i <= BUSY_RETRY_DELAYS_MS.length; i++) {
+    try {
+      await apiCall(apiUrl, { action: "set", key, value, token });
+      return true;
+    } catch (err) {
+      lastErr = err;
+      const isBusy = /guardando otro cambio|ocupado/i.test(err.message || "");
+      if (isBusy && i < BUSY_RETRY_DELAYS_MS.length) {
+        await new Promise((r) => setTimeout(r, BUSY_RETRY_DELAYS_MS[i]));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
 }
 
 async function sheetTestConnection(apiUrl) {
@@ -490,15 +505,16 @@ function useSheetCollection(apiUrl, key, seed, token) {
     return () => { clearTimeout(startTimer); if (interval) clearInterval(interval); };
   }, [apiUrl, token, saving, loadFromSheet]);
 
-  const persist = useCallback(async (next) => {
+  const persist = useCallback(async (next, delta) => {
     setDataState(next);
     if (!apiUrl || !token) return;
     setSaving(true);
     try {
-      await sheetSet(apiUrl, key, next, token);
+      await sheetSet(apiUrl, key, delta !== undefined ? delta : next, token);
       setError(null);
-      const confirmed = await sheetGet(apiUrl, key, token);
-      if (confirmed) setDataState(confirmed);
+      // Nota: ya no se vuelve a leer todo el Sheet tras guardar (era una
+      // lectura completa extra en el momento de más carga). Se confía en
+      // el estado local optimista; el sondeo en segundo plano reconcilia.
     } catch (e) {
       setError("No se pudo guardar en el Sheet (" + e.message + ").");
     } finally {
@@ -1210,7 +1226,7 @@ function useDraftProject(project, onUpdate) {
         pendingRef.current = false;
         timerRef.current = null;
         onUpdate(next);
-      }, immediate ? 150 : 850);
+      }, immediate ? 400 : 850);
       return next;
     });
   }, [onUpdate]);
@@ -2098,21 +2114,22 @@ function ConnectedApp({ apiUrl }) {
   // 2) nuevas actualizaciones en rojo.
   // Así evitamos duplicados y mantenemos una única fuente de verdad en el Sheet.
   const updateProject = (updated) => {
-    persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)));
+    persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)), [updated]);
   };
 
   const shareProject = (updated) => {
-    persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)));
+    persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)), [updated]);
   };
 
   const archiveProject = (id) => {
-    persistProjects(allProjects.map((p) => (p.id === id ? { ...p, archived: true } : p)));
+    const archived = { ...(allProjects.find((p) => p.id === id) || {}), id, archived: true };
+    persistProjects(allProjects.map((p) => (p.id === id ? archived : p)), [archived]);
     setOpenId(null);
     setProjectIdInUrl(null);
   };
   const createProject = (f) => {
-    const np = { ...f, id: uid(), archived: false, phases: [], risks: [], updates: [], lastUpdateAt: null, sharedWith: isAdmin ? [] : "all" };
-    persistProjects([...allProjects, np]);
+    const np = { ...f, id: uid(), archived: false, phases: [], risks: [], updates: [], columns: [], tasks: [], lastUpdateAt: null, sharedWith: isAdmin ? [] : "all" };
+    persistProjects([...allProjects, np], [np]);
     setShowNew(false);
   };
 
@@ -2190,7 +2207,12 @@ function ConnectedApp({ apiUrl }) {
               notifications={notifications}
               currentEmail={currentUser.email}
               onOpenProject={goToProject}
-              onMarkRead={(id) => persistNotifications(notifications.map((n) => (n.id === id ? { ...n, read: true } : n)))}
+              onMarkRead={(id) => {
+                const target = notifications.find((n) => n.id === id);
+                if (!target) return;
+                const updatedN = { ...target, read: true };
+                persistNotifications(notifications.map((n) => (n.id === id ? updatedN : n)), [updatedN]);
+              }}
             />
           </div>
 
