@@ -205,11 +205,34 @@ const SEED_PROJECTS = [
      modificados en el Sheet.
    - useAuth: sesión con token, contraseña y dispositivo de confianza.
 ---------------------------------------------------------------- */
+function getAppBaseUrl() {
+  return window.location.origin + window.location.pathname;
+}
+
+function getProjectIdFromUrl() {
+  try { return new URLSearchParams(window.location.search).get("project") || null; }
+  catch (e) { return null; }
+}
+
+function setProjectIdInUrl(projectId) {
+  try {
+    const url = new URL(window.location.href);
+    if (projectId) {
+      url.searchParams.set("project", projectId);
+    } else {
+      url.searchParams.delete("project");
+      url.searchParams.delete("source");
+    }
+    window.history.replaceState({}, "", url.toString());
+  } catch (e) {}
+}
+
 async function apiCall(apiUrl, payload) {
+  const finalPayload = { appUrl: getAppBaseUrl(), ...(payload || {}) };
   const res = await fetch(apiUrl, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight CORS en Apps Script
-    body: JSON.stringify(payload || {}),
+    body: JSON.stringify(finalPayload),
   });
   const json = await res.json();
   if (!json.ok) throw new Error(json.error || "Respuesta inválida del servidor");
@@ -1636,7 +1659,7 @@ function ConnectedApp({ apiUrl }) {
   }, [apiUrl]);
 
   const [view, setView] = useState("dashboard");
-  const [openId, setOpenId] = useState(null);
+  const [openId, setOpenId] = useState(() => getProjectIdFromUrl());
   const [showNew, setShowNew] = useState(false);
 
   if (bootstrap.loading || auth.loading) {
@@ -1727,41 +1750,22 @@ function ConnectedApp({ apiUrl }) {
     return Array.isArray(p.sharedWith) && p.sharedWith.includes(currentUser.email);
   });
 
-  const notify = (toEmail, message, projectId) => {
-    if (toEmail === currentUser.email) return null;
-    return { id: uid(), toEmail, message, projectId, date: new Date().toISOString(), read: false };
+  // El backend relacional crea notificaciones y envía correo HTML cuando detecta:
+  // 1) nuevos usuarios compartidos en un proyecto;
+  // 2) nuevas actualizaciones en rojo.
+  // Así evitamos duplicados y mantenemos una única fuente de verdad en el Sheet.
+  const updateProject = (updated) => {
+    persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)));
   };
 
-  const updateProject = (updated, alsoNotify) => {
+  const shareProject = (updated) => {
     persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)));
-    if (alsoNotify) {
-      const targets = updated.sharedWith === "all"
-        ? users.filter((u) => u.active).map((u) => u.email)
-        : (updated.sharedWith || []);
-      const newNotifs = targets
-        .map((e) => notify(e, `${updated.name}: nueva actualización — el proyecto ha cambiado a ${SEMAFORO[updated.semaphore].label}.`, updated.id))
-        .filter(Boolean);
-      if (newNotifs.length) persistNotifications([...notifications, ...newNotifs]);
-    }
-  };
-
-  const shareProject = (updated, wasShared) => {
-    persistProjects(allProjects.map((p) => (p.id === updated.id ? updated : p)));
-    if (wasShared) {
-      const prev = allProjects.find((p) => p.id === updated.id);
-      const prevList = Array.isArray(prev.sharedWith) ? prev.sharedWith : [];
-      const newList = Array.isArray(updated.sharedWith) ? updated.sharedWith : [];
-      const newlyAdded = newList.filter((e) => !prevList.includes(e));
-      const newNotifs = newlyAdded
-        .map((e) => notify(e, `${currentUser.name} te ha dado acceso al proyecto "${updated.name}".`, updated.id))
-        .filter(Boolean);
-      if (newNotifs.length) persistNotifications([...notifications, ...newNotifs]);
-    }
   };
 
   const archiveProject = (id) => {
     persistProjects(allProjects.map((p) => (p.id === id ? { ...p, archived: true } : p)));
     setOpenId(null);
+    setProjectIdInUrl(null);
   };
   const createProject = (f) => {
     const np = { ...f, id: uid(), archived: false, phases: [], risks: [], updates: [], lastUpdateAt: null, sharedWith: isAdmin ? [] : "all" };
@@ -1783,7 +1787,16 @@ function ConnectedApp({ apiUrl }) {
   };
 
   const openProject = visibleProjects.find((p) => p.id === openId);
-  const goToProject = (id) => { if (visibleProjects.some((p) => p.id === id)) setOpenId(id); };
+  const openProjectById = (id) => {
+    if (!id) return;
+    setOpenId(id);
+    setProjectIdInUrl(id);
+  };
+  const closeProject = () => {
+    setOpenId(null);
+    setProjectIdInUrl(null);
+  };
+  const goToProject = (id) => { if (visibleProjects.some((p) => p.id === id)) openProjectById(id); };
 
   return (
     <div className="min-h-screen" style={{ background: COLORS.paper, fontFamily: "'Inter', sans-serif", color: COLORS.ink }}>
@@ -1797,14 +1810,14 @@ function ConnectedApp({ apiUrl }) {
             <span className="text-white font-semibold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Trackr</span>
           </div>
           <nav className="px-3 mt-2 space-y-1">
-            <button onClick={() => { setView("dashboard"); setOpenId(null); }} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ background: view === "dashboard" && !openId ? COLORS.inkSoft : "transparent", color: view === "dashboard" && !openId ? "white" : "#9CA3AF" }}>
+            <button onClick={() => { setView("dashboard"); closeProject(); }} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ background: view === "dashboard" && !openId ? COLORS.inkSoft : "transparent", color: view === "dashboard" && !openId ? "white" : "#9CA3AF" }}>
               <LayoutDashboard size={16} /> Dashboard
             </button>
-            <button onClick={() => { setView("projects"); setOpenId(null); }} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ background: view === "projects" && !openId ? COLORS.inkSoft : "transparent", color: view === "projects" && !openId ? "white" : "#9CA3AF" }}>
+            <button onClick={() => { setView("projects"); closeProject(); }} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ background: view === "projects" && !openId ? COLORS.inkSoft : "transparent", color: view === "projects" && !openId ? "white" : "#9CA3AF" }}>
               <FolderKanban size={16} /> Proyectos
             </button>
             {isAdmin && (
-              <button onClick={() => { setView("users"); setOpenId(null); }} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ background: view === "users" && !openId ? COLORS.inkSoft : "transparent", color: view === "users" && !openId ? "white" : "#9CA3AF" }}>
+              <button onClick={() => { setView("users"); closeProject(); }} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ background: view === "users" && !openId ? COLORS.inkSoft : "transparent", color: view === "users" && !openId ? "white" : "#9CA3AF" }}>
                 <ShieldCheck size={16} /> Usuarios
               </button>
             )}
@@ -1841,7 +1854,7 @@ function ConnectedApp({ apiUrl }) {
           {openProject ? (
             <ProjectDetail
               project={openProject}
-              onBack={() => setOpenId(null)}
+              onBack={closeProject}
               onUpdate={updateProject}
               onShare={shareProject}
               onArchive={() => archiveProject(openProject.id)}
@@ -1852,9 +1865,9 @@ function ConnectedApp({ apiUrl }) {
           ) : view === "users" && isAdmin ? (
             <UsersPage users={users} onCreateUser={createUser} onUpdateUser={updateUser} onToggleActive={toggleUserActive} currentEmail={currentUser.email} />
           ) : view === "dashboard" ? (
-            <Dashboard projects={visibleProjects} onOpen={setOpenId} onNew={() => setShowNew(true)} canCreate={isAdmin} />
+            <Dashboard projects={visibleProjects} onOpen={openProjectById} onNew={() => setShowNew(true)} canCreate={isAdmin} />
           ) : (
-            <ProjectsList projects={visibleProjects} onOpen={setOpenId} onNew={() => setShowNew(true)} canCreate={isAdmin} />
+            <ProjectsList projects={visibleProjects} onOpen={openProjectById} onNew={() => setShowNew(true)} canCreate={isAdmin} />
           )}
         </div>
       </div>
