@@ -20,7 +20,7 @@
   <div id="root"></div>
 
   <script type="text/plain" id="app-source">
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useCallback, useRef } = React;
 
 /* ---------------------------------------------------------------
    ICONOS — sustituyen a lucide-react (no disponible vía CDN sin
@@ -1172,6 +1172,298 @@ function Dashboard({ projects, onOpen, onNew, canCreate }) {
 /* ---------------------------------------------------------------
    PROJECT DETAIL
 ---------------------------------------------------------------- */
+/* ---------------------------------------------------------------
+   TABLERO KANBAN (estilo Trello)
+   - Usa un "borrador" local: la UI responde al instante mientras
+     escribes o arrastras, y el guardado real al Sheet se dispara
+     con retardo (debounce) tras dejar de escribir — así una tecla
+     nunca dispara una petición de red por sí sola.
+   - Mientras hay cambios pendientes de guardar, el tablero IGNORA
+     las actualizaciones que llegan del sondeo del Sheet, para no
+     pisar lo que estás escribiendo. En cuanto se guarda, se vuelve
+     a sincronizar con la versión remota.
+---------------------------------------------------------------- */
+const DEFAULT_BOARD_COLUMNS = () => ([
+  { id: uid(), name: "Por hacer" },
+  { id: uid(), name: "En curso" },
+  { id: uid(), name: "Hecho" },
+]);
+
+function useDraftProject(project, onUpdate) {
+  const [draft, setDraft] = useState(project);
+  const timerRef = useRef(null);
+  const pendingRef = useRef(false);
+
+  useEffect(() => {
+    if (pendingRef.current) return; // hay cambios sin guardar: no pisar el borrador
+    setDraft(project);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project]);
+
+  const commit = useCallback((updater, opts) => {
+    const immediate = !!(opts && opts.immediate);
+    setDraft((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      pendingRef.current = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        pendingRef.current = false;
+        timerRef.current = null;
+        onUpdate(next);
+      }, immediate ? 150 : 850);
+      return next;
+    });
+  }, [onUpdate]);
+
+  const flushNow = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+      pendingRef.current = false;
+      onUpdate(draft);
+    }
+  }, [draft, onUpdate]);
+
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  return [draft, commit, flushNow];
+}
+
+function BoardTab({ project, onUpdate, canEdit, users }) {
+  const [draft, commit, flushNow] = useDraftProject(project, onUpdate);
+  const [openTaskId, setOpenTaskId] = useState(null);
+  const [addingIn, setAddingIn] = useState(null);
+  const [newTitle, setNewTitle] = useState("");
+  const [dragTaskId, setDragTaskId] = useState(null);
+
+  const columns = draft.columns && draft.columns.length ? draft.columns : DEFAULT_BOARD_COLUMNS();
+  const tasks = draft.tasks || [];
+
+  useEffect(() => {
+    // Si el proyecto todavía no tiene columnas (proyectos antiguos o recién creados),
+    // crea las 3 columnas por defecto una sola vez, en segundo plano.
+    if (!draft.columns || draft.columns.length === 0) {
+      commit((prev) => ({ ...prev, columns: DEFAULT_BOARD_COLUMNS() }), { immediate: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const tasksByColumn = (columnId) => tasks.filter((t) => t.columnId === columnId);
+
+  const addCard = (columnId) => {
+    const title = newTitle.trim();
+    if (!title) { setAddingIn(null); return; }
+    commit((prev) => ({
+      ...prev,
+      tasks: [...(prev.tasks || []), { id: uid(), columnId, title, description: "", assignee: "", dueDate: "", createdAt: new Date().toISOString() }],
+    }), { immediate: true });
+    setNewTitle("");
+    setAddingIn(columnId);
+  };
+
+  const addColumn = () => {
+    commit((prev) => ({ ...prev, columns: [...(prev.columns && prev.columns.length ? prev.columns : DEFAULT_BOARD_COLUMNS()), { id: uid(), name: "Nueva columna" }] }), { immediate: true });
+  };
+
+  const renameColumn = (columnId, name) => {
+    commit((prev) => ({ ...prev, columns: (prev.columns || columns).map((c) => (c.id === columnId ? { ...c, name } : c)) }));
+  };
+
+  const deleteColumn = (columnId) => {
+    if (!window.confirm("¿Eliminar esta columna y sus tarjetas?")) return;
+    commit((prev) => ({
+      ...prev,
+      columns: (prev.columns || columns).filter((c) => c.id !== columnId),
+      tasks: (prev.tasks || []).filter((t) => t.columnId !== columnId),
+    }), { immediate: true });
+  };
+
+  const updateTask = (taskId, patch, opts) => {
+    commit((prev) => ({ ...prev, tasks: (prev.tasks || []).map((t) => (t.id === taskId ? { ...t, ...patch } : t)) }), opts);
+  };
+
+  const deleteTask = (taskId) => {
+    commit((prev) => ({ ...prev, tasks: (prev.tasks || []).filter((t) => t.id !== taskId) }), { immediate: true });
+    setOpenTaskId(null);
+  };
+
+  const moveTask = (taskId, toColumnId, toIndex) => {
+    commit((prev) => {
+      const list = prev.tasks || [];
+      const moving = list.find((t) => t.id === taskId);
+      if (!moving) return prev;
+      const withoutMoving = list.filter((t) => t.id !== taskId);
+      const destTasks = withoutMoving.filter((t) => t.columnId === toColumnId);
+      const otherTasks = withoutMoving.filter((t) => t.columnId !== toColumnId);
+      const insertAt = Math.max(0, Math.min(toIndex, destTasks.length));
+      destTasks.splice(insertAt, 0, { ...moving, columnId: toColumnId });
+      return { ...prev, tasks: [...otherTasks, ...destTasks] };
+    }, { immediate: true });
+  };
+
+  const openTask = tasks.find((t) => t.id === openTaskId);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <p className="text-sm" style={{ color: COLORS.textDim }}>Arrastra las tarjetas entre columnas, como en Trello. Los cambios se guardan solos.</p>
+        {canEdit && (
+          <button onClick={addColumn} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border hover:bg-gray-50" style={{ borderColor: COLORS.line }}>
+            <Plus size={13} /> Columna
+          </button>
+        )}
+      </div>
+      <div className="flex gap-4 overflow-x-auto pb-2" style={{ minHeight: 200 }}>
+        {columns.map((col) => (
+          <div
+            key={col.id}
+            className="rounded-2xl border flex-shrink-0 flex flex-col"
+            style={{ width: 272, background: COLORS.paperCard, borderColor: COLORS.line, maxHeight: "70vh" }}
+            onDragOver={(e) => { if (canEdit) e.preventDefault(); }}
+            onDrop={(e) => {
+              if (!canEdit || !dragTaskId) return;
+              e.preventDefault();
+              moveTask(dragTaskId, col.id, tasksByColumn(col.id).length);
+              setDragTaskId(null);
+            }}
+          >
+            <div className="flex items-center justify-between px-3 py-2.5 border-b" style={{ borderColor: COLORS.line }}>
+              {canEdit ? (
+                <input
+                  value={col.name}
+                  onChange={(e) => renameColumn(col.id, e.target.value)}
+                  className="text-sm font-semibold bg-transparent outline-none w-full mr-2"
+                />
+              ) : (
+                <span className="text-sm font-semibold">{col.name}</span>
+              )}
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span className="text-xs rounded-full px-1.5 py-0.5" style={{ background: COLORS.paper, color: COLORS.textDim }}>{tasksByColumn(col.id).length}</span>
+                {canEdit && (
+                  <button onClick={() => deleteColumn(col.id)} className="p-1 rounded hover:bg-gray-100">
+                    <Trash2 size={12} color={COLORS.textDim} />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-2 space-y-2">
+              {tasksByColumn(col.id).map((t, idx) => (
+                <div
+                  key={t.id}
+                  draggable={canEdit}
+                  onDragStart={() => setDragTaskId(t.id)}
+                  onDragEnd={() => setDragTaskId(null)}
+                  onDragOver={(e) => { if (canEdit) e.preventDefault(); }}
+                  onDrop={(e) => {
+                    if (!canEdit || !dragTaskId) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    moveTask(dragTaskId, col.id, idx);
+                    setDragTaskId(null);
+                  }}
+                  onClick={() => setOpenTaskId(t.id)}
+                  className="rounded-xl border p-2.5 text-sm cursor-pointer hover:shadow-sm transition bg-white"
+                  style={{ borderColor: COLORS.line, opacity: dragTaskId === t.id ? 0.4 : 1 }}
+                >
+                  <p className="font-medium leading-snug">{t.title}</p>
+                  {(t.assignee || t.dueDate) && (
+                    <div className="flex items-center gap-2 mt-2 flex-wrap">
+                      {t.assignee && <Pill color={COLORS.accent} soft={COLORS.accentSoft}><User size={10} /> {t.assignee}</Pill>}
+                      {t.dueDate && <Pill color={COLORS.textDim} soft="#F1F2F0"><Calendar size={10} /> {fmtDate(t.dueDate)}</Pill>}
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {addingIn === col.id ? (
+                <div className="rounded-xl border p-2" style={{ borderColor: COLORS.accent }}>
+                  <textarea
+                    autoFocus
+                    rows={2}
+                    value={newTitle}
+                    onChange={(e) => setNewTitle(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); addCard(col.id); } if (e.key === "Escape") { setAddingIn(null); setNewTitle(""); } }}
+                    placeholder="Título de la tarjeta…"
+                    className="w-full text-sm outline-none resize-none"
+                  />
+                  <div className="flex gap-2 mt-1.5">
+                    <button onClick={() => addCard(col.id)} className="text-xs font-semibold px-2.5 py-1 rounded-lg text-white" style={{ background: COLORS.accent }}>Añadir</button>
+                    <button onClick={() => { setAddingIn(null); setNewTitle(""); }} className="p-1 rounded hover:bg-gray-100"><X size={14} color={COLORS.textDim} /></button>
+                  </div>
+                </div>
+              ) : canEdit ? (
+                <button onClick={() => { setAddingIn(col.id); setNewTitle(""); }} className="w-full flex items-center gap-1.5 text-xs font-medium px-2 py-1.5 rounded-lg hover:bg-gray-50" style={{ color: COLORS.textDim }}>
+                  <Plus size={13} /> Añadir tarjeta
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {openTask && (
+        <Modal title="Tarjeta" onClose={() => { flushNow(); setOpenTaskId(null); }}>
+          <TaskCardModal
+            task={openTask}
+            users={users}
+            canEdit={canEdit}
+            onChange={(patch) => updateTask(openTask.id, patch)}
+            onDelete={() => deleteTask(openTask.id)}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function TaskCardModal({ task, users, canEdit, onChange, onDelete }) {
+  const [title, setTitle] = useState(task.title);
+  const [description, setDescription] = useState(task.description || "");
+
+  useEffect(() => { setTitle(task.title); setDescription(task.description || ""); }, [task.id]);
+
+  return (
+    <div>
+      <Field label="Título">
+        <input
+          className={inputCls} style={inputStyle}
+          value={title}
+          disabled={!canEdit}
+          onChange={(e) => { setTitle(e.target.value); onChange({ title: e.target.value }); }}
+        />
+      </Field>
+      <Field label="Descripción">
+        <textarea
+          className={inputCls} style={inputStyle} rows={4}
+          value={description}
+          disabled={!canEdit}
+          onChange={(e) => { setDescription(e.target.value); onChange({ description: e.target.value }); }}
+          placeholder="Detalles de la tarea…"
+        />
+      </Field>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Asignado a">
+          <select className={inputCls} style={inputStyle} value={task.assignee || ""} disabled={!canEdit} onChange={(e) => onChange({ assignee: e.target.value })}>
+            <option value="">Sin asignar</option>
+            {users.filter((u) => u.active).map((u) => <option key={u.id} value={u.name}>{u.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Fecha límite">
+          <input type="date" className={inputCls} style={inputStyle} value={task.dueDate || ""} disabled={!canEdit} onChange={(e) => onChange({ dueDate: e.target.value })} />
+        </Field>
+      </div>
+      {canEdit && (
+        <div className="flex justify-end pt-2">
+          <button onClick={onDelete} className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium hover:bg-red-50" style={{ color: COLORS.red }}>
+            <Trash2 size={14} /> Eliminar tarjeta
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProjectDetail({ project, onBack, onUpdate, onShare, onArchive, canEdit, isAdmin, users }) {
   const [tab, setTab] = useState("resumen");
   const [showEdit, setShowEdit] = useState(false);
@@ -1181,6 +1473,7 @@ function ProjectDetail({ project, onBack, onUpdate, onShare, onArchive, canEdit,
 
   const tabs = [
     { id: "resumen", label: "Resumen", icon: <FileText size={14} /> },
+    { id: "tablero", label: "Tablero", icon: <LayoutDashboard size={14} /> },
     { id: "cronograma", label: "Cronograma", icon: <Milestone size={14} /> },
     { id: "riesgos", label: "Riesgos", icon: <ShieldAlert size={14} /> },
     { id: "actualizaciones", label: "Actualizaciones", icon: <History size={14} /> },
@@ -1257,6 +1550,10 @@ function ProjectDetail({ project, onBack, onUpdate, onShare, onArchive, canEdit,
             </Section>
           </div>
         </div>
+      )}
+
+      {tab === "tablero" && (
+        <BoardTab project={project} onUpdate={onUpdate} canEdit={canEdit} users={users} />
       )}
 
       {tab === "cronograma" && (
