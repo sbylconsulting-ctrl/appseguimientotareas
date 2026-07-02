@@ -203,31 +203,60 @@ const SEED_PROJECTS = [
    - useSheetCollection: lee/escribe una "tabla" en el Sheet vía fetch()
      contra el Apps Script y se refresca periódicamente para pintar datos
      modificados en el Sheet.
-   - useSession: quién ha iniciado sesión solo en memoria. No usa almacenamiento local.
+   - useAuth: sesión con token, contraseña y dispositivo de confianza.
 ---------------------------------------------------------------- */
-async function sheetGet(apiUrl, key) {
-  const res = await fetch(`${apiUrl}?action=get&key=${encodeURIComponent(key)}`);
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || "Error al leer del Sheet");
-  return json.value ? JSON.parse(json.value) : null;
-}
-
-async function sheetSet(apiUrl, key, value) {
+async function apiCall(apiUrl, payload) {
   const res = await fetch(apiUrl, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight CORS en Apps Script
-    body: JSON.stringify({ action: "set", key, value: JSON.stringify(value) }),
+    body: JSON.stringify(payload || {}),
   });
   const json = await res.json();
-  if (!json.ok) throw new Error(json.error || "Error al guardar en el Sheet");
+  if (!json.ok) throw new Error(json.error || "Respuesta inválida del servidor");
+  return json;
+}
+
+async function sheetGet(apiUrl, key, token) {
+  const json = await apiCall(apiUrl, { action: "get", key, token });
+  return json.value == null ? null : json.value;
+}
+
+async function sheetSet(apiUrl, key, value, token) {
+  await apiCall(apiUrl, { action: "set", key, value, token });
   return true;
 }
 
 async function sheetTestConnection(apiUrl) {
-  const res = await fetch(`${apiUrl}?action=list&prefix=`);
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || "Respuesta inválida");
-  return true;
+  const json = await apiCall(apiUrl, { action: "bootstrap" });
+  return json;
+}
+
+async function authSetupAdmin(apiUrl, { name, email, password, deviceId }) {
+  return apiCall(apiUrl, { action: "setupAdmin", name, email, password, deviceId, trustDevice: true });
+}
+async function authLogin(apiUrl, { email, password, deviceId, trustDevice }) {
+  return apiCall(apiUrl, { action: "login", email, password, deviceId, trustDevice });
+}
+async function authTrustedLogin(apiUrl, { email, deviceId }) {
+  return apiCall(apiUrl, { action: "trustedLogin", email, deviceId });
+}
+async function authSession(apiUrl, token) {
+  return apiCall(apiUrl, { action: "session", token });
+}
+async function authMigrationSetPassword(apiUrl, { email, password, deviceId, trustDevice }) {
+  return apiCall(apiUrl, { action: "migrationSetPassword", email, password, deviceId, trustDevice });
+}
+async function authLogoutDevice(apiUrl, { token, deviceId }) {
+  return apiCall(apiUrl, { action: "logoutDevice", token, deviceId });
+}
+async function adminCreateUserApi(apiUrl, token, user) {
+  return apiCall(apiUrl, { action: "adminCreateUser", token, user });
+}
+async function adminUpdateUserApi(apiUrl, token, id, user) {
+  return apiCall(apiUrl, { action: "adminUpdateUser", token, id, user });
+}
+async function adminSetUserActiveApi(apiUrl, token, id, active) {
+  return apiCall(apiUrl, { action: "adminSetUserActive", token, id, active });
 }
 
 function useSheetApiUrl() {
@@ -236,71 +265,179 @@ function useSheetApiUrl() {
   return { url: configured ? url : null, setUrl: () => {}, loading: false };
 }
 
-function useSheetCollection(apiUrl, key, seed) {
-  const [data, setData] = useState(seed || []);
+const STORAGE_KEYS = {
+  deviceId: "trackr.deviceId.v2",
+  sessionToken: "trackr.sessionToken.v2",
+  lastEmail: "trackr.lastEmail.v2",
+};
+
+function randomId(len = 32) {
+  const bytes = new Uint8Array(len);
+  if (window.crypto && window.crypto.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function getDeviceId() {
+  let id = localStorage.getItem(STORAGE_KEYS.deviceId);
+  if (!id) {
+    id = randomId(32);
+    localStorage.setItem(STORAGE_KEYS.deviceId, id);
+  }
+  return id;
+}
+
+function clearStoredSession({ forgetDevice = false } = {}) {
+  localStorage.removeItem(STORAGE_KEYS.sessionToken);
+  if (forgetDevice) localStorage.removeItem(STORAGE_KEYS.lastEmail);
+}
+
+function useAuth(apiUrl) {
+  const [token, setToken] = useState(() => localStorage.getItem(STORAGE_KEYS.sessionToken));
+  const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState(null);
+  const [rememberedEmail, setRememberedEmail] = useState(() => localStorage.getItem(STORAGE_KEYS.lastEmail) || "");
+
+  const finishAuth = useCallback((payload, emailForDevice) => {
+    setToken(payload.token);
+    setUser(payload.user);
+    localStorage.setItem(STORAGE_KEYS.sessionToken, payload.token);
+    if (emailForDevice) {
+      localStorage.setItem(STORAGE_KEYS.lastEmail, emailForDevice.trim().toLowerCase());
+      setRememberedEmail(emailForDevice.trim().toLowerCase());
+    }
+    setAuthError(null);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!apiUrl) return;
+      setLoading(true);
+      const storedToken = localStorage.getItem(STORAGE_KEYS.sessionToken);
+      const storedEmail = localStorage.getItem(STORAGE_KEYS.lastEmail);
+      try {
+        if (storedToken) {
+          const payload = await authSession(apiUrl, storedToken);
+          if (!cancelled) finishAuth(payload, payload.user.email);
+          return;
+        }
+        if (storedEmail) {
+          const payload = await authTrustedLogin(apiUrl, { email: storedEmail, deviceId: getDeviceId() });
+          if (!cancelled) finishAuth(payload, storedEmail);
+          return;
+        }
+      } catch (e) {
+        clearStoredSession();
+        if (!cancelled) setAuthError(null);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [apiUrl, finishAuth]);
+
+  const setupAdmin = useCallback(async ({ name, email, password }) => {
+    const payload = await authSetupAdmin(apiUrl, { name, email, password, deviceId: getDeviceId() });
+    finishAuth(payload, email);
+    return payload;
+  }, [apiUrl, finishAuth]);
+
+  const login = useCallback(async ({ email, password, trustDevice }) => {
+    const payload = await authLogin(apiUrl, { email, password, trustDevice, deviceId: getDeviceId() });
+    finishAuth(payload, trustDevice ? email : "");
+    if (!trustDevice) localStorage.removeItem(STORAGE_KEYS.lastEmail);
+    return payload;
+  }, [apiUrl, finishAuth]);
+
+  const trustedLogin = useCallback(async (email) => {
+    const payload = await authTrustedLogin(apiUrl, { email, deviceId: getDeviceId() });
+    finishAuth(payload, email);
+    return payload;
+  }, [apiUrl, finishAuth]);
+
+  const migratePassword = useCallback(async ({ email, password, trustDevice }) => {
+    const payload = await authMigrationSetPassword(apiUrl, { email, password, trustDevice, deviceId: getDeviceId() });
+    finishAuth(payload, trustDevice ? email : "");
+    return payload;
+  }, [apiUrl, finishAuth]);
+
+  const logout = useCallback(async ({ forgetDevice = false } = {}) => {
+    const currentToken = localStorage.getItem(STORAGE_KEYS.sessionToken) || token;
+    try {
+      if (forgetDevice && currentToken) await authLogoutDevice(apiUrl, { token: currentToken, deviceId: getDeviceId() });
+    } catch (e) {}
+    clearStoredSession({ forgetDevice });
+    setToken(null);
+    setUser(null);
+    if (forgetDevice) setRememberedEmail("");
+  }, [apiUrl, token]);
+
+  return { token, user, loading, authError, rememberedEmail, setupAdmin, login, trustedLogin, migratePassword, logout, setUser };
+}
+
+function useSheetCollection(apiUrl, key, seed, token) {
+  const [data, setDataState] = useState(seed || []);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
 
   const loadFromSheet = useCallback(async ({ initializeIfMissing = false, silent = false } = {}) => {
-    if (!apiUrl) return;
+    if (!apiUrl || !token) return;
     if (!silent) setLoading(true);
     try {
-      let value = await sheetGet(apiUrl, key);
+      let value = await sheetGet(apiUrl, key, token);
       if (!value && initializeIfMissing) {
         value = seed || [];
-        await sheetSet(apiUrl, key, value);
+        await sheetSet(apiUrl, key, value, token);
       }
-      setData(value || seed || []);
+      setDataState(value || seed || []);
       setError(null);
     } catch (e) {
       setError("No se pudo conectar con el Sheet (" + e.message + ").");
     } finally {
       if (!silent) setLoading(false);
     }
-    // seed intentionally omitted: it is only used to initialize an empty Sheet once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, apiUrl]);
+  }, [key, apiUrl, token]);
 
   useEffect(() => {
-    if (!apiUrl) return;
+    if (!apiUrl || !token) {
+      setLoading(false);
+      return;
+    }
     loadFromSheet({ initializeIfMissing: true });
-  }, [key, apiUrl, loadFromSheet]);
+  }, [key, apiUrl, token, loadFromSheet]);
 
   useEffect(() => {
-    if (!apiUrl) return;
+    if (!apiUrl || !token) return;
     const timer = setInterval(() => {
       if (!saving) loadFromSheet({ silent: true });
     }, SHEET_POLL_MS);
     return () => clearInterval(timer);
-  }, [apiUrl, saving, loadFromSheet]);
+  }, [apiUrl, token, saving, loadFromSheet]);
 
   const persist = useCallback(async (next) => {
-    setData(next);
-    if (!apiUrl) return;
+    setDataState(next);
+    if (!apiUrl || !token) return;
     setSaving(true);
     try {
-      await sheetSet(apiUrl, key, next);
+      await sheetSet(apiUrl, key, next, token);
       setError(null);
-      // Confirmamos desde el Sheet para que la pantalla pinte exactamente lo guardado.
-      const confirmed = await sheetGet(apiUrl, key);
-      if (confirmed) setData(confirmed);
+      const confirmed = await sheetGet(apiUrl, key, token);
+      if (confirmed) setDataState(confirmed);
     } catch (e) {
       setError("No se pudo guardar en el Sheet (" + e.message + ").");
     } finally {
       setSaving(false);
     }
-  }, [key, apiUrl]);
+  }, [key, apiUrl, token]);
 
-  return { data, setData: persist, loading, error, saving };
-}
-
-function useSession() {
-  // Sesión solo en memoria: al cerrar o recargar el navegador se vuelve a pedir usuario.
-  // Los datos de proyectos, usuarios y notificaciones viven únicamente en el Google Sheet vía Apps Script.
-  const [email, setEmailState] = useState(null);
-  const setEmail = useCallback((val) => setEmailState(val), []);
-  return { email, setEmail, loading: false };
+  return { data, setData: persist, setLocalData: setDataState, loading, error, saving, reload: loadFromSheet };
 }
 
 /* ---------------------------------------------------------------
@@ -429,12 +566,50 @@ function ConfigureSheet({ initialUrl, onSaved }) {
 }
 
 /* ---------------------------------------------------------------
-   AUTH: SETUP + SIGN IN (prototype-level, not real security)
+   AUTH: SETUP + SIGN IN
 ---------------------------------------------------------------- */
+function PasswordInput({ value, onChange, placeholder = "Mínimo 8 caracteres", autoComplete = "current-password" }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="flex gap-2">
+      <input
+        type={show ? "text" : "password"}
+        className={inputCls}
+        style={inputStyle}
+        value={value}
+        onChange={onChange}
+        placeholder={placeholder}
+        autoComplete={autoComplete}
+      />
+      <button type="button" onClick={() => setShow(!show)} className="px-3 py-2 rounded-lg border text-sm font-medium" style={{ borderColor: COLORS.line }}>
+        {show ? "Ocultar" : "Ver"}
+      </button>
+    </div>
+  );
+}
+
 function SetupAdmin({ onCreate }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
-  const valid = name.trim() && validEmail(email);
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const valid = name.trim() && validEmail(email) && password.length >= 8 && password === confirm;
+
+  const submit = async () => {
+    if (!valid || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onCreate({ name: name.trim(), email: email.trim().toLowerCase(), password });
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div className="min-h-screen flex items-center justify-center px-4" style={{ background: COLORS.paper, fontFamily: "'Inter', sans-serif" }}>
       <style>{FONT_IMPORT}</style>
@@ -443,128 +618,122 @@ function SetupAdmin({ onCreate }) {
           <Target size={18} color="white" />
         </div>
         <h1 className="text-xl font-bold mb-1" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Configura Trackr</h1>
-        <p className="text-sm mb-5" style={{ color: COLORS.textDim }}>Crea la cuenta de administrador. Podrás dar de alta al resto de usuarios después.</p>
+        <p className="text-sm mb-5" style={{ color: COLORS.textDim }}>Crea la cuenta de administrador. Esta contraseña se guarda cifrada en el backend y este dispositivo quedará como dispositivo de confianza.</p>
         <Field label="Tu nombre">
           <input className={inputCls} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="Nombre y apellidos" />
         </Field>
         <Field label="Tu correo">
-          <input className={inputCls} style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@empresa.com" />
+          <input className={inputCls} style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@empresa.com" autoComplete="username" />
         </Field>
+        <Field label="Contraseña">
+          <PasswordInput value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+        </Field>
+        <Field label="Repetir contraseña" hint={confirm && password !== confirm ? "Las contraseñas no coinciden." : ""}>
+          <PasswordInput value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
+        </Field>
+        {error && <div className="text-sm px-3 py-2 rounded-lg mb-4" style={{ background: COLORS.redSoft, color: COLORS.red }}>{error}</div>}
         <button
-          disabled={!valid}
-          onClick={() => onCreate({ name: name.trim(), email: email.trim().toLowerCase() })}
-          style={{ background: valid ? COLORS.accent : "#C7C8E8" }}
+          disabled={!valid || saving}
+          onClick={submit}
+          style={{ background: valid && !saving ? COLORS.accent : "#C7C8E8" }}
           className="w-full py-2.5 rounded-lg text-sm font-semibold text-white transition mt-2"
         >
-          Crear cuenta de administrador
+          {saving ? "Creando…" : "Crear cuenta de administrador"}
         </button>
       </div>
     </div>
   );
 }
 
-function SignIn({ users, projects, onSignIn }) {
-  const active = users.filter((u) => u.active);
-  const [email, setEmail] = useState("");
-  const match = active.find((u) => u.email === email.trim().toLowerCase());
-  const visibleProjects = (projects || []).filter((p) => !p.archived).slice(0, 6);
-  const counts = { green: 0, amber: 0, red: 0 };
-  (projects || []).filter((p) => !p.archived).forEach((p) => { if (counts[p.semaphore] !== undefined) counts[p.semaphore]++; });
+function SignIn({ onSignIn, onTrustedSignIn, rememberedEmail, migrationRequired, onMigratePassword }) {
+  const [email, setEmail] = useState(rememberedEmail || "");
+  const [password, setPassword] = useState("");
+  const [trustDevice, setTrustDevice] = useState(true);
+  const [mode, setMode] = useState(migrationRequired ? "migrate" : "login");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const validLogin = validEmail(email) && password.length >= 1;
+  const validMigration = validEmail(email) && password.length >= 8 && password === confirm;
+
+  useEffect(() => { if (rememberedEmail && !email) setEmail(rememberedEmail); }, [rememberedEmail]);
+
+  const submit = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      if (mode === "migrate") {
+        await onMigratePassword({ email: email.trim().toLowerCase(), password, trustDevice });
+      } else {
+        await onSignIn({ email: email.trim().toLowerCase(), password, trustDevice });
+      }
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const useTrusted = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      await onTrustedSignIn((rememberedEmail || email).trim().toLowerCase());
+    } catch (e) {
+      setError(e.message || "Este dispositivo todavía no está autorizado.");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <div className="min-h-screen px-4 py-8 flex items-center justify-center" style={{ background: COLORS.paper, fontFamily: "'Inter', sans-serif" }}>
       <style>{FONT_IMPORT}</style>
-      <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
-        <div className="bg-white rounded-2xl border p-7" style={{ borderColor: COLORS.line }}>
-          <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4" style={{ background: COLORS.accent }}>
-            <Lock size={18} color="white" />
-          </div>
-          <h1 className="text-xl font-bold mb-1" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Selecciona tu usuario</h1>
-          <p className="text-sm mb-5" style={{ color: COLORS.textDim }}>
-            La información se acaba de leer del Google Sheet. Este navegador no guarda datos de la app en local.
-          </p>
-          <Field label="Correo">
-            <input className={inputCls} style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@empresa.com" />
-          </Field>
-          <button
-            disabled={!match}
-            onClick={() => onSignIn(match.email)}
-            style={{ background: match ? COLORS.accent : "#C7C8E8" }}
-            className="w-full py-2.5 rounded-lg text-sm font-semibold text-white transition mb-4"
-          >
-            Entrar
+      <div className="w-full max-w-md bg-white rounded-2xl border p-7" style={{ borderColor: COLORS.line }}>
+        <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4" style={{ background: COLORS.accent }}>
+          <Lock size={18} color="white" />
+        </div>
+        <h1 className="text-xl font-bold mb-1" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Entrar en Trackr</h1>
+        <p className="text-sm mb-5" style={{ color: COLORS.textDim }}>
+          {mode === "migrate" ? "Configura una contraseña para un usuario existente creado con la versión anterior." : "Introduce tu correo y contraseña. Si marcas dispositivo de confianza, la próxima vez entrarás automáticamente desde este navegador."}
+        </p>
+
+        {rememberedEmail && mode === "login" && (
+          <button onClick={useTrusted} disabled={loading} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm font-semibold mb-4" style={{ borderColor: COLORS.line }}>
+            <span>Entrar sin contraseña en este dispositivo</span>
+            <ArrowRight size={15} />
           </button>
-          {active.length > 0 && (
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.textDim }}>Usuarios cargados desde el Sheet</p>
-              <div className="space-y-1 max-h-52 overflow-y-auto">
-                {active.map((u) => (
-                  <button key={u.id} onClick={() => onSignIn(u.email)} className="w-full flex items-center justify-between text-left px-2.5 py-1.5 rounded-lg hover:bg-gray-50 text-sm">
-                    <span>{u.name} <span style={{ color: COLORS.textDim }}>· {u.role}</span></span>
-                    <ArrowRight size={13} color={COLORS.textDim} />
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
+        )}
 
-        <div className="bg-white rounded-2xl border p-7" style={{ borderColor: COLORS.line }}>
-          <div className="flex items-start justify-between gap-3 mb-5">
-            <div>
-              <h2 className="text-xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Datos actuales del Sheet</h2>
-              <p className="text-sm mt-1" style={{ color: COLORS.textDim }}>
-                Esto se pinta antes de iniciar sesión para confirmar que la app está leyendo el Sheet.
-              </p>
-            </div>
-            <Pill color={COLORS.green} soft={COLORS.greenSoft}><CheckCircle2 size={12} /> Sheet conectado</Pill>
-          </div>
-
-          <div className="grid grid-cols-4 gap-2 mb-5">
-            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
-              <div className="text-xs" style={{ color: COLORS.textDim }}>Proyectos</div>
-              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{(projects || []).filter((p) => !p.archived).length}</div>
-            </div>
-            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
-              <div className="text-xs" style={{ color: COLORS.textDim }}>Verde</div>
-              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.green }}>{counts.green}</div>
-            </div>
-            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
-              <div className="text-xs" style={{ color: COLORS.textDim }}>Ámbar</div>
-              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.amber }}>{counts.amber}</div>
-            </div>
-            <div className="rounded-xl border p-3" style={{ borderColor: COLORS.line }}>
-              <div className="text-xs" style={{ color: COLORS.textDim }}>Rojo</div>
-              <div className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.red }}>{counts.red}</div>
-            </div>
-          </div>
-
-          <div className="space-y-2 max-h-80 overflow-y-auto">
-            {visibleProjects.length === 0 && (
-              <div className="rounded-xl border p-4 text-sm" style={{ borderColor: COLORS.line, color: COLORS.textDim }}>
-                Todavía no hay proyectos guardados en el Sheet. Entra como admin y crea el primer registro; se guardará inmediatamente en la pestaña KV.
-              </div>
-            )}
-            {visibleProjects.map((p) => {
-              const sem = SEMAFORO[p.semaphore] || SEMAFORO.green;
-              return (
-                <div key={p.id} className="rounded-xl border p-4" style={{ borderColor: COLORS.line }}>
-                  <div className="flex items-start gap-3">
-                    <SignalBar semaphore={p.semaphore} />
-                    <div className="min-w-0 flex-1">
-                      <div className="font-semibold truncate">{p.name}</div>
-                      <p className="text-xs mt-1 line-clamp-2" style={{ color: COLORS.textDim }}>{p.summary || p.objective || "Sin resumen"}</p>
-                      <div className="flex items-center gap-2 mt-2 flex-wrap">
-                        <Pill color={sem.color} soft={sem.soft}>{sem.label}</Pill>
-                        <span className="text-xs" style={{ color: COLORS.textDim }}>Última actualización: {fmtDate(p.lastUpdateAt)}</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        <Field label="Correo">
+          <input className={inputCls} style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@empresa.com" autoComplete="username" />
+        </Field>
+        <Field label={mode === "migrate" ? "Nueva contraseña" : "Contraseña"}>
+          <PasswordInput value={password} onChange={(e) => setPassword(e.target.value)} autoComplete={mode === "migrate" ? "new-password" : "current-password"} />
+        </Field>
+        {mode === "migrate" && (
+          <Field label="Repetir contraseña" hint={confirm && password !== confirm ? "Las contraseñas no coinciden." : ""}>
+            <PasswordInput value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
+          </Field>
+        )}
+        <label className="flex items-start gap-2 text-sm mb-4 select-none">
+          <input type="checkbox" checked={trustDevice} onChange={(e) => setTrustDevice(e.target.checked)} className="mt-1" />
+          <span>Confiar en este dispositivo y no pedir contraseña la próxima vez.</span>
+        </label>
+        {error && <div className="text-sm px-3 py-2 rounded-lg mb-4" style={{ background: COLORS.redSoft, color: COLORS.red }}>{error}</div>}
+        <button
+          disabled={loading || (mode === "migrate" ? !validMigration : !validLogin)}
+          onClick={submit}
+          style={{ background: !loading && (mode === "migrate" ? validMigration : validLogin) ? COLORS.accent : "#C7C8E8" }}
+          className="w-full py-2.5 rounded-lg text-sm font-semibold text-white transition"
+        >
+          {loading ? "Comprobando…" : mode === "migrate" ? "Guardar contraseña y entrar" : "Entrar"}
+        </button>
+        {migrationRequired && (
+          <button onClick={() => { setMode(mode === "login" ? "migrate" : "login"); setError(""); }} className="w-full text-xs mt-3" style={{ color: COLORS.textDim }}>
+            {mode === "login" ? "Tengo un usuario antiguo sin contraseña" : "Ya tengo contraseña"}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1180,21 +1349,36 @@ const EmptyState = ({ text }) => (
 /* ---------------------------------------------------------------
    USERS MANAGEMENT (admin only)
 ---------------------------------------------------------------- */
-function UsersPage({ users, onChange, currentEmail }) {
+function UsersPage({ users, onCreateUser, onUpdateUser, onToggleActive, currentEmail }) {
   const [showNew, setShowNew] = useState(false);
   const [editing, setEditing] = useState(null);
+  const [error, setError] = useState("");
 
-  const addUser = (u) => {
-    if (users.some((x) => x.email === u.email)) return;
-    onChange([...users, { ...u, id: uid(), active: true, createdAt: todayISO() }]);
-    setShowNew(false);
+  const addUser = async (u) => {
+    setError("");
+    try {
+      await onCreateUser(u);
+      setShowNew(false);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
   };
-  const saveEdit = (u) => {
-    onChange(users.map((x) => (x.id === editing.id ? { ...x, ...u } : x)));
-    setEditing(null);
+  const saveEdit = async (u) => {
+    setError("");
+    try {
+      await onUpdateUser(editing.id, u);
+      setEditing(null);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
   };
-  const toggleActive = (id) => {
-    onChange(users.map((x) => (x.id === id ? { ...x, active: !x.active } : x)));
+  const toggleActive = async (u) => {
+    setError("");
+    try {
+      await onToggleActive(u.id, !u.active);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
   };
 
   return (
@@ -1202,12 +1386,13 @@ function UsersPage({ users, onChange, currentEmail }) {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Usuarios</h1>
-          <p className="text-sm mt-1" style={{ color: COLORS.textDim }}>Da de alta a las personas que pueden acceder y decide qué ven.</p>
+          <p className="text-sm mt-1" style={{ color: COLORS.textDim }}>Da de alta usuarios con contraseña y decide qué ven.</p>
         </div>
         <button onClick={() => setShowNew(true)} className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-white" style={{ background: COLORS.accent }}>
           <Plus size={16} /> Nuevo usuario
         </button>
       </div>
+      {error && <div className="text-sm px-3 py-2 rounded-lg mb-4" style={{ background: COLORS.redSoft, color: COLORS.red }}>{error}</div>}
 
       <div className="rounded-2xl border overflow-hidden" style={{ borderColor: COLORS.line, background: COLORS.paperCard }}>
         <table className="w-full text-sm">
@@ -1216,6 +1401,7 @@ function UsersPage({ users, onChange, currentEmail }) {
               <th className="px-4 py-3 font-medium">Nombre</th>
               <th className="px-4 py-3 font-medium">Correo</th>
               <th className="px-4 py-3 font-medium">Rol</th>
+              <th className="px-4 py-3 font-medium">Dispositivos</th>
               <th className="px-4 py-3 font-medium">Estado</th>
               <th className="px-4 py-3 font-medium"></th>
             </tr>
@@ -1226,9 +1412,10 @@ function UsersPage({ users, onChange, currentEmail }) {
                 <td className="px-4 py-3 font-medium">{u.name} {u.email === currentEmail && <span className="text-xs font-normal" style={{ color: COLORS.textDim }}>(tú)</span>}</td>
                 <td className="px-4 py-3" style={{ color: COLORS.textDim }}>{u.email}</td>
                 <td className="px-4 py-3"><Pill color={COLORS.accent} soft={COLORS.accentSoft}>{u.role}</Pill></td>
+                <td className="px-4 py-3" style={{ color: COLORS.textDim }}>{u.trustedDevicesCount || 0}</td>
                 <td className="px-4 py-3">
                   <button
-                    onClick={() => u.email !== currentEmail && toggleActive(u.id)}
+                    onClick={() => u.email !== currentEmail && toggleActive(u)}
                     disabled={u.email === currentEmail}
                     className="text-xs font-semibold px-2.5 py-1 rounded-full"
                     style={{ background: u.active ? COLORS.greenSoft : "#F1F2F0", color: u.active ? COLORS.green : COLORS.textDim, opacity: u.email === currentEmail ? 0.6 : 1 }}
@@ -1260,10 +1447,15 @@ function UsersPage({ users, onChange, currentEmail }) {
 }
 
 function UserForm({ initial, onSave, onCancel, existing }) {
-  const [f, setF] = useState(initial || { name: "", email: "", role: "Stakeholder" });
+  const [f, setF] = useState(initial || { name: "", email: "", role: "Stakeholder", password: "" });
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
-  const emailTaken = !initial && existing.some((u) => u.email === f.email.trim().toLowerCase());
-  const valid = f.name.trim() && validEmail(f.email) && !emailTaken;
+  const normalizedEmail = f.email.trim().toLowerCase();
+  const emailTaken = !initial && existing.some((u) => u.email === normalizedEmail);
+  const needsPassword = !initial;
+  const passwordOk = needsPassword ? password.length >= 8 && password === confirm : (!password || (password.length >= 8 && password === confirm));
+  const valid = f.name.trim() && validEmail(f.email) && !emailTaken && passwordOk;
   return (
     <div>
       <Field label="Nombre">
@@ -1277,9 +1469,17 @@ function UserForm({ initial, onSave, onCancel, existing }) {
           {ROLES.map((r) => <option key={r}>{r}</option>)}
         </select>
       </Field>
+      <Field label={initial ? "Nueva contraseña (opcional)" : "Contraseña"} hint={initial ? "Déjalo vacío para mantener la contraseña actual." : "Mínimo 8 caracteres."}>
+        <PasswordInput value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+      </Field>
+      {(password || !initial) && (
+        <Field label="Repetir contraseña" hint={confirm && password !== confirm ? "Las contraseñas no coinciden." : ""}>
+          <PasswordInput value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
+        </Field>
+      )}
       <div className="flex justify-end gap-2 pt-2">
         <button onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-100">Cancelar</button>
-        <button disabled={!valid} onClick={() => onSave({ ...f, name: f.name.trim(), email: f.email.trim().toLowerCase() })} style={{ background: valid ? COLORS.accent : "#C7C8E8" }} className="px-4 py-2 rounded-lg text-sm font-medium text-white">
+        <button disabled={!valid} onClick={() => onSave({ name: f.name.trim(), email: normalizedEmail, role: f.role, password: password || undefined })} style={{ background: valid ? COLORS.accent : "#C7C8E8" }} className="px-4 py-2 rounded-lg text-sm font-medium text-white">
           {initial ? "Guardar cambios" : "Dar de alta"}
         </button>
       </div>
@@ -1410,14 +1610,84 @@ function App() {
 }
 
 function ConnectedApp({ apiUrl }) {
-  const { data: allProjects, setData: persistProjects, loading: loadingProjects, error: projectsError, saving } = useSheetCollection(apiUrl, "projects-data", []);
-  const { data: users, setData: persistUsers, loading: loadingUsers, error: usersError } = useSheetCollection(apiUrl, "users-data", []);
-  const { data: notifications, setData: persistNotifications, error: notifError } = useSheetCollection(apiUrl, "notifications-data", []);
-  const { email: sessionEmail, setEmail: setSessionEmail } = useSession();
+  const auth = useAuth(apiUrl);
+  const [bootstrap, setBootstrap] = useState({ loading: true, setupRequired: false, passwordMigrationRequired: false, error: null });
+
+  const projectsStore = useSheetCollection(apiUrl, "projects-data", [], auth.token);
+  const usersStore = useSheetCollection(apiUrl, "users-data", [], auth.token);
+  const notificationsStore = useSheetCollection(apiUrl, "notifications-data", [], auth.token);
+
+  const { data: allProjects, setData: persistProjects, loading: loadingProjects, error: projectsError, saving } = projectsStore;
+  const { data: users, setLocalData: setUsersLocal, loading: loadingUsers, error: usersError } = usersStore;
+  const { data: notifications, setData: persistNotifications, error: notifError } = notificationsStore;
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const info = await sheetTestConnection(apiUrl);
+        if (!cancelled) setBootstrap({ loading: false, setupRequired: !!info.setupRequired, passwordMigrationRequired: !!info.passwordMigrationRequired, error: null });
+      } catch (e) {
+        if (!cancelled) setBootstrap({ loading: false, setupRequired: false, passwordMigrationRequired: false, error: e.message || String(e) });
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [apiUrl]);
 
   const [view, setView] = useState("dashboard");
   const [openId, setOpenId] = useState(null);
   const [showNew, setShowNew] = useState(false);
+
+  if (bootstrap.loading || auth.loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: COLORS.paper }}>
+        <Loader2 className="animate-spin" size={24} color={COLORS.accent} />
+      </div>
+    );
+  }
+
+  if (bootstrap.error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-4" style={{ background: COLORS.paper }}>
+        <div className="max-w-sm text-center">
+          <AlertTriangle size={28} color={COLORS.red} className="mx-auto mb-3" />
+          <p className="text-sm mb-3" style={{ color: COLORS.textDim }}>No se pudo conectar con el Apps Script: {bootstrap.error}</p>
+          <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>
+            Comprueba que Code.gs tenga el SPREADSHEET_ID correcto, que la implementación sea una nueva versión y que la Web App sea accesible para cualquier usuario.
+          </p>
+          <button onClick={() => window.location.reload()} className="px-4 py-2 rounded-lg text-sm font-semibold text-white" style={{ background: COLORS.accent }}>
+            Reintentar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!auth.user) {
+    if (bootstrap.setupRequired) {
+      return (
+        <SetupAdmin
+          onCreate={async ({ name, email, password }) => {
+            await auth.setupAdmin({ name, email, password });
+            setBootstrap((b) => ({ ...b, setupRequired: false, passwordMigrationRequired: false }));
+          }}
+        />
+      );
+    }
+    return (
+      <SignIn
+        rememberedEmail={auth.rememberedEmail}
+        migrationRequired={bootstrap.passwordMigrationRequired}
+        onSignIn={auth.login}
+        onTrustedSignIn={auth.trustedLogin}
+        onMigratePassword={async (payload) => {
+          await auth.migratePassword(payload);
+          setBootstrap((b) => ({ ...b, passwordMigrationRequired: false }));
+        }}
+      />
+    );
+  }
 
   const loading = loadingProjects || loadingUsers;
   const connError = projectsError || usersError || notifError;
@@ -1447,23 +1717,7 @@ function ConnectedApp({ apiUrl }) {
     );
   }
 
-  if (users.length === 0) {
-    return (
-      <SetupAdmin
-        onCreate={async ({ name, email }) => {
-          const admin = { id: uid(), name, email, role: "Admin", active: true, createdAt: todayISO() };
-          await persistUsers([admin]);
-          setSessionEmail(email);
-        }}
-      />
-    );
-  }
-
-  const currentUser = users.find((u) => u.email === sessionEmail && u.active);
-  if (!currentUser) {
-    return <SignIn users={users} projects={allProjects} onSignIn={setSessionEmail} />;
-  }
-
+  const currentUser = users.find((u) => u.email === auth.user.email && u.active) || auth.user;
   const isAdmin = currentUser.role === "Admin";
   const canEditRole = currentUser.role === "Admin" || currentUser.role === "Project Owner";
 
@@ -1515,6 +1769,19 @@ function ConnectedApp({ apiUrl }) {
     setShowNew(false);
   };
 
+  const createUser = async (u) => {
+    const res = await adminCreateUserApi(apiUrl, auth.token, u);
+    setUsersLocal(res.users || []);
+  };
+  const updateUser = async (id, u) => {
+    const res = await adminUpdateUserApi(apiUrl, auth.token, id, u);
+    setUsersLocal(res.users || []);
+  };
+  const toggleUserActive = async (id, active) => {
+    const res = await adminSetUserActiveApi(apiUrl, auth.token, id, active);
+    setUsersLocal(res.users || []);
+  };
+
   const openProject = visibleProjects.find((p) => p.id === openId);
   const goToProject = (id) => { if (visibleProjects.some((p) => p.id === id)) setOpenId(id); };
 
@@ -1552,8 +1819,11 @@ function ConnectedApp({ apiUrl }) {
                 <p className="text-xs truncate" style={{ color: "#6B7280" }}>{currentUser.role}</p>
               </div>
             </div>
-            <button onClick={() => setSessionEmail(null)} className="w-full flex items-center gap-1.5 text-xs mt-2 px-2.5 py-1.5 rounded-lg hover:bg-white/5" style={{ color: "#9CA3AF" }}>
-              <LogOut size={12} /> Cambiar de usuario
+            <button onClick={() => auth.logout()} className="w-full flex items-center gap-1.5 text-xs mt-2 px-2.5 py-1.5 rounded-lg hover:bg-white/5" style={{ color: "#9CA3AF" }}>
+              <LogOut size={12} /> Cerrar sesión
+            </button>
+            <button onClick={() => auth.logout({ forgetDevice: true })} className="w-full flex items-center gap-1.5 text-xs mt-1 px-2.5 py-1.5 rounded-lg hover:bg-white/5" style={{ color: "#9CA3AF" }}>
+              <ShieldAlert size={12} /> Olvidar dispositivo
             </button>
           </div>
         </div>
@@ -1580,7 +1850,7 @@ function ConnectedApp({ apiUrl }) {
               users={users}
             />
           ) : view === "users" && isAdmin ? (
-            <UsersPage users={users} onChange={persistUsers} currentEmail={currentUser.email} />
+            <UsersPage users={users} onCreateUser={createUser} onUpdateUser={updateUser} onToggleActive={toggleUserActive} currentEmail={currentUser.email} />
           ) : view === "dashboard" ? (
             <Dashboard projects={visibleProjects} onOpen={setOpenId} onNew={() => setShowNew(true)} canCreate={isAdmin} />
           ) : (
