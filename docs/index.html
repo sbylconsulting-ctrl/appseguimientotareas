@@ -23,6 +23,17 @@
 const { useState, useEffect, useCallback } = React;
 
 /* ---------------------------------------------------------------
+   CONFIGURACIÓN DE ACCESO
+   - La app ya NO pide la URL al usuario al abrir.
+   - Para usar Google Sheet compartido, pega aquí UNA sola vez la URL
+     de Apps Script que termina en /exec y sube este index.html a GitHub.
+   - Si lo dejas vacío, Trackr entra directo y guarda datos en este navegador.
+---------------------------------------------------------------- */
+const TRACKR_SHEET_API_URL = "";
+const TRACKR_STORAGE_MODE = TRACKR_SHEET_API_URL.trim() ? "sheet" : "local";
+
+
+/* ---------------------------------------------------------------
    ICONOS — sustituyen a lucide-react (no disponible vía CDN sin
    bundler). Mismos nombres/API que antes: <Plus size={16}/> etc.
 ---------------------------------------------------------------- */
@@ -235,13 +246,31 @@ function useSheetApiUrl() {
 }
 
 function useSheetCollection(apiUrl, key, seed) {
-  const [data, setData] = useState(seed || []);
-  const [loading, setLoading] = useState(true);
+  const isLocalMode = !apiUrl || apiUrl === "local";
+  const storageKey = "trackr-" + key;
+
+  const readLocal = () => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) return JSON.parse(saved);
+      if (seed !== undefined) localStorage.setItem(storageKey, JSON.stringify(seed || []));
+    } catch { /* non-fatal */ }
+    return seed || [];
+  };
+
+  const [data, setData] = useState(() => isLocalMode ? readLocal() : (seed || []));
+  const [loading, setLoading] = useState(!isLocalMode);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (!apiUrl) return;
+    if (isLocalMode) {
+      setData(readLocal());
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
     (async () => {
       setLoading(true);
       try {
@@ -253,7 +282,7 @@ function useSheetCollection(apiUrl, key, seed) {
         setData(value);
         setError(null);
       } catch (e) {
-        setError("No se pudo conectar con el Sheet (" + e.message + ").");
+        setError("No se pudo conectar con el almacenamiento compartido (" + e.message + ").");
       } finally {
         setLoading(false);
       }
@@ -263,17 +292,20 @@ function useSheetCollection(apiUrl, key, seed) {
 
   const persist = useCallback(async (next) => {
     setData(next);
-    if (!apiUrl) return;
     setSaving(true);
     try {
-      await sheetSet(apiUrl, key, next);
+      if (isLocalMode) {
+        localStorage.setItem(storageKey, JSON.stringify(next));
+      } else {
+        await sheetSet(apiUrl, key, next);
+      }
       setError(null);
     } catch (e) {
-      setError("No se pudo guardar en el Sheet (" + e.message + ").");
+      setError("No se pudo guardar (" + e.message + ").");
     } finally {
       setSaving(false);
     }
-  }, [key, apiUrl]);
+  }, [key, apiUrl, isLocalMode]);
 
   return { data, setData: persist, loading, error, saving };
 }
@@ -1302,21 +1334,26 @@ function ProjectsList({ projects, onOpen, onNew, canCreate }) {
    APP SHELL
 ---------------------------------------------------------------- */
 function App() {
-  const { url: apiUrl, setUrl: setApiUrl, loading: loadingUrl } = useSheetApiUrl();
+  const embeddedApiUrl = (TRACKR_SHEET_API_URL || "").trim();
+  const apiUrl = embeddedApiUrl || "local";
 
-  if (loadingUrl) {
-    return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: COLORS.paper }}>
-        <Loader2 className="animate-spin" size={24} color={COLORS.accent} />
-      </div>
-    );
-  }
+  const handleStorageAction = () => {
+    if (embeddedApiUrl) {
+      alert("Trackr ya tiene la conexión configurada en el index.html. No hace falta introducir ninguna URL en pantalla.");
+      return;
+    }
+    if (confirm("Esto borrará los datos guardados en este navegador y reiniciará Trackr. ¿Continuar?")) {
+      try {
+        localStorage.removeItem("trackr-projects-data");
+        localStorage.removeItem("trackr-users-data");
+        localStorage.removeItem("trackr-notifications-data");
+        localStorage.removeItem("session-email");
+      } catch { /* non-fatal */ }
+      window.location.reload();
+    }
+  };
 
-  if (!apiUrl) {
-    return <ConfigureSheet onSaved={setApiUrl} />;
-  }
-
-  return <ConnectedApp apiUrl={apiUrl} onChangeUrl={() => setApiUrl(null)} />;
+  return <ConnectedApp apiUrl={apiUrl} onChangeUrl={handleStorageAction} />;
 }
 
 function ConnectedApp({ apiUrl, onChangeUrl }) {
@@ -1331,6 +1368,8 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
 
   const loading = loadingProjects || loadingUsers;
   const connError = projectsError || usersError || notifError;
+  const isLocalMode = !apiUrl || apiUrl === "local";
+  const storageName = isLocalMode ? "datos locales" : "Google Sheet";
 
   if (loading) {
     return (
@@ -1347,7 +1386,7 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
           <AlertTriangle size={28} color={COLORS.red} className="mx-auto mb-3" />
           <p className="text-sm mb-4" style={{ color: COLORS.textDim }}>{connError}</p>
           <button onClick={onChangeUrl} className="px-4 py-2 rounded-lg text-sm font-semibold text-white" style={{ background: COLORS.accent }}>
-            Revisar conexión al Sheet
+            Revisar almacenamiento
           </button>
         </div>
       </div>
@@ -1450,7 +1489,7 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
             )}
             {isAdmin && (
               <button onClick={onChangeUrl} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ color: "#9CA3AF" }}>
-                <FileText size={16} /> Conexión al Sheet
+                <FileText size={16} /> Almacenamiento
               </button>
             )}
           </nav>
@@ -1509,7 +1548,7 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
 
       {saving && (
         <div className="fixed bottom-4 right-4 flex items-center gap-2 text-xs px-3 py-2 rounded-lg shadow-lg text-white" style={{ background: COLORS.ink }}>
-          <Loader2 className="animate-spin" size={12} /> Guardando en el Sheet…
+          <Loader2 className="animate-spin" size={12} /> Guardando…
         </div>
       )}
     </div>
