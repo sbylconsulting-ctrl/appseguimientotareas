@@ -23,17 +23,6 @@
 const { useState, useEffect, useCallback } = React;
 
 /* ---------------------------------------------------------------
-   CONFIGURACIÓN DE ACCESO
-   - La app ya NO pide la URL al usuario al abrir.
-   - Para usar Google Sheet compartido, pega aquí UNA sola vez la URL
-     de Apps Script que termina en /exec y sube este index.html a GitHub.
-   - Si lo dejas vacío, Trackr entra directo y guarda datos en este navegador.
----------------------------------------------------------------- */
-const TRACKR_SHEET_API_URL = "";
-const TRACKR_STORAGE_MODE = TRACKR_SHEET_API_URL.trim() ? "sheet" : "local";
-
-
-/* ---------------------------------------------------------------
    ICONOS — sustituyen a lucide-react (no disponible vía CDN sin
    bundler). Mismos nombres/API que antes: <Plus size={16}/> etc.
 ---------------------------------------------------------------- */
@@ -117,6 +106,14 @@ const ESTADO_RIESGO = ["Abierto", "En seguimiento", "Mitigado", "Cerrado"];
 const ESTADO_FASE = ["Pendiente", "En curso", "Completada", "Bloqueada"];
 const PRIORIDADES = ["Alta", "Media", "Baja"];
 const ROLES = ["Admin", "Project Owner", "Stakeholder", "Viewer"];
+
+/* ---------------------------------------------------------------
+   CONFIGURACIÓN FIJA DEL GOOGLE SHEET
+   Pega aquí UNA SOLA VEZ la URL de tu Apps Script Web App.
+   Debe terminar en /exec. Los usuarios nunca tendrán que introducirla.
+---------------------------------------------------------------- */
+const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbxv-4f-sLLJR1UEXFeATP7kCAPPDIUt1dUfDE1o_pKZAP1054vXkmgqUVuIa5eAHk2Yzg/exec";
+const SHEET_POLL_MS = 15000; // refresca la app leyendo el Sheet cada 15 segundos
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -202,11 +199,10 @@ const SEED_PROJECTS = [
 
 /* ---------------------------------------------------------------
    STORAGE HOOKS
-   - useSheetApiUrl: dirección del Apps Script, guardada en localStorage
-     de este navegador (cada persona la pega una vez).
+   - useSheetApiUrl: usa la URL fija SHEET_API_URL; no pide nada al usuario.
    - useSheetCollection: lee/escribe una "tabla" en el Sheet vía fetch()
-     contra el Apps Script (funciona porque GitHub Pages no tiene las
-     restricciones de red de un artifact de Claude).
+     contra el Apps Script y se refresca periódicamente para pintar datos
+     modificados en el Sheet.
    - useSession: quién ha iniciado sesión en este navegador.
 ---------------------------------------------------------------- */
 async function sheetGet(apiUrl, key) {
@@ -235,77 +231,66 @@ async function sheetTestConnection(apiUrl) {
 }
 
 function useSheetApiUrl() {
-  const [url, setUrlState] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("sheet-api-url") || "null"); } catch { return null; }
-  });
-  const setUrl = useCallback((val) => {
-    setUrlState(val);
-    try { localStorage.setItem("sheet-api-url", JSON.stringify(val)); } catch { /* non-fatal */ }
-  }, []);
-  return { url, setUrl, loading: false };
+  const url = (SHEET_API_URL || "").trim();
+  const configured = url && !url.includes("PEGA_AQUI") && url.endsWith("/exec");
+  return { url: configured ? url : null, setUrl: () => {}, loading: false };
 }
 
 function useSheetCollection(apiUrl, key, seed) {
-  const isLocalMode = !apiUrl || apiUrl === "local";
-  const storageKey = "trackr-" + key;
-
-  const readLocal = () => {
-    try {
-      const saved = localStorage.getItem(storageKey);
-      if (saved) return JSON.parse(saved);
-      if (seed !== undefined) localStorage.setItem(storageKey, JSON.stringify(seed || []));
-    } catch { /* non-fatal */ }
-    return seed || [];
-  };
-
-  const [data, setData] = useState(() => isLocalMode ? readLocal() : (seed || []));
-  const [loading, setLoading] = useState(!isLocalMode);
+  const [data, setData] = useState(seed || []);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    if (isLocalMode) {
-      setData(readLocal());
-      setLoading(false);
-      setError(null);
-      return;
-    }
-
-    (async () => {
-      setLoading(true);
-      try {
-        let value = await sheetGet(apiUrl, key);
-        if (!value) {
-          value = seed || [];
-          await sheetSet(apiUrl, key, value);
-        }
-        setData(value);
-        setError(null);
-      } catch (e) {
-        setError("No se pudo conectar con el almacenamiento compartido (" + e.message + ").");
-      } finally {
-        setLoading(false);
+  const loadFromSheet = useCallback(async ({ initializeIfMissing = false, silent = false } = {}) => {
+    if (!apiUrl) return;
+    if (!silent) setLoading(true);
+    try {
+      let value = await sheetGet(apiUrl, key);
+      if (!value && initializeIfMissing) {
+        value = seed || [];
+        await sheetSet(apiUrl, key, value);
       }
-    })();
+      setData(value || seed || []);
+      setError(null);
+    } catch (e) {
+      setError("No se pudo conectar con el Sheet (" + e.message + ").");
+    } finally {
+      if (!silent) setLoading(false);
+    }
+    // seed intentionally omitted: it is only used to initialize an empty Sheet once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, apiUrl]);
 
+  useEffect(() => {
+    if (!apiUrl) return;
+    loadFromSheet({ initializeIfMissing: true });
+  }, [key, apiUrl, loadFromSheet]);
+
+  useEffect(() => {
+    if (!apiUrl) return;
+    const timer = setInterval(() => {
+      if (!saving) loadFromSheet({ silent: true });
+    }, SHEET_POLL_MS);
+    return () => clearInterval(timer);
+  }, [apiUrl, saving, loadFromSheet]);
+
   const persist = useCallback(async (next) => {
     setData(next);
+    if (!apiUrl) return;
     setSaving(true);
     try {
-      if (isLocalMode) {
-        localStorage.setItem(storageKey, JSON.stringify(next));
-      } else {
-        await sheetSet(apiUrl, key, next);
-      }
+      await sheetSet(apiUrl, key, next);
       setError(null);
+      // Confirmamos desde el Sheet para que la pantalla pinte exactamente lo guardado.
+      const confirmed = await sheetGet(apiUrl, key);
+      if (confirmed) setData(confirmed);
     } catch (e) {
-      setError("No se pudo guardar (" + e.message + ").");
+      setError("No se pudo guardar en el Sheet (" + e.message + ").");
     } finally {
       setSaving(false);
     }
-  }, [key, apiUrl, isLocalMode]);
+  }, [key, apiUrl]);
 
   return { data, setData: persist, loading, error, saving };
 }
@@ -1334,29 +1319,35 @@ function ProjectsList({ projects, onOpen, onNew, canCreate }) {
    APP SHELL
 ---------------------------------------------------------------- */
 function App() {
-  const embeddedApiUrl = (TRACKR_SHEET_API_URL || "").trim();
-  const apiUrl = embeddedApiUrl || "local";
+  const { url: apiUrl, loading: loadingUrl } = useSheetApiUrl();
 
-  const handleStorageAction = () => {
-    if (embeddedApiUrl) {
-      alert("Trackr ya tiene la conexión configurada en el index.html. No hace falta introducir ninguna URL en pantalla.");
-      return;
-    }
-    if (confirm("Esto borrará los datos guardados en este navegador y reiniciará Trackr. ¿Continuar?")) {
-      try {
-        localStorage.removeItem("trackr-projects-data");
-        localStorage.removeItem("trackr-users-data");
-        localStorage.removeItem("trackr-notifications-data");
-        localStorage.removeItem("session-email");
-      } catch { /* non-fatal */ }
-      window.location.reload();
-    }
-  };
+  if (loadingUrl) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: COLORS.paper }}>
+        <Loader2 className="animate-spin" size={24} color={COLORS.accent} />
+      </div>
+    );
+  }
 
-  return <ConnectedApp apiUrl={apiUrl} onChangeUrl={handleStorageAction} />;
+  if (!apiUrl) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-4" style={{ background: COLORS.paper, fontFamily: "'Inter', sans-serif" }}>
+        <style>{FONT_IMPORT}</style>
+        <div className="max-w-md bg-white rounded-2xl border p-7 text-center" style={{ borderColor: COLORS.line }}>
+          <AlertTriangle size={28} color={COLORS.red} className="mx-auto mb-3" />
+          <h1 className="text-xl font-bold mb-2" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Falta configurar la conexión al Sheet</h1>
+          <p className="text-sm" style={{ color: COLORS.textDim }}>
+            Abre el archivo index.html y reemplaza la constante SHEET_API_URL por la URL de Apps Script que termina en /exec. Después vuelve a subir el archivo a GitHub.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return <ConnectedApp apiUrl={apiUrl} />;
 }
 
-function ConnectedApp({ apiUrl, onChangeUrl }) {
+function ConnectedApp({ apiUrl }) {
   const { data: allProjects, setData: persistProjects, loading: loadingProjects, error: projectsError, saving } = useSheetCollection(apiUrl, "projects-data", SEED_PROJECTS);
   const { data: users, setData: persistUsers, loading: loadingUsers, error: usersError } = useSheetCollection(apiUrl, "users-data", []);
   const { data: notifications, setData: persistNotifications, error: notifError } = useSheetCollection(apiUrl, "notifications-data", []);
@@ -1368,8 +1359,6 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
 
   const loading = loadingProjects || loadingUsers;
   const connError = projectsError || usersError || notifError;
-  const isLocalMode = !apiUrl || apiUrl === "local";
-  const storageName = isLocalMode ? "datos locales" : "Google Sheet";
 
   if (loading) {
     return (
@@ -1384,9 +1373,12 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
       <div className="min-h-screen flex items-center justify-center px-4" style={{ background: COLORS.paper }}>
         <div className="max-w-sm text-center">
           <AlertTriangle size={28} color={COLORS.red} className="mx-auto mb-3" />
-          <p className="text-sm mb-4" style={{ color: COLORS.textDim }}>{connError}</p>
-          <button onClick={onChangeUrl} className="px-4 py-2 rounded-lg text-sm font-semibold text-white" style={{ background: COLORS.accent }}>
-            Revisar almacenamiento
+          <p className="text-sm mb-3" style={{ color: COLORS.textDim }}>{connError}</p>
+          <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>
+            Comprueba que el Apps Script esté implementado como Aplicación web, ejecutándose como tú y accesible para cualquier usuario.
+          </p>
+          <button onClick={() => window.location.reload()} className="px-4 py-2 rounded-lg text-sm font-semibold text-white" style={{ background: COLORS.accent }}>
+            Reintentar
           </button>
         </div>
       </div>
@@ -1487,11 +1479,6 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
                 <ShieldCheck size={16} /> Usuarios
               </button>
             )}
-            {isAdmin && (
-              <button onClick={onChangeUrl} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition" style={{ color: "#9CA3AF" }}>
-                <FileText size={16} /> Almacenamiento
-              </button>
-            )}
           </nav>
           <div className="mt-auto px-4 py-4 border-t" style={{ borderColor: "#2A303C" }}>
             <div className="flex items-center gap-2 mb-1">
@@ -1548,7 +1535,7 @@ function ConnectedApp({ apiUrl, onChangeUrl }) {
 
       {saving && (
         <div className="fixed bottom-4 right-4 flex items-center gap-2 text-xs px-3 py-2 rounded-lg shadow-lg text-white" style={{ background: COLORS.ink }}>
-          <Loader2 className="animate-spin" size={12} /> Guardando…
+          <Loader2 className="animate-spin" size={12} /> Guardando en el Sheet…
         </div>
       )}
     </div>
